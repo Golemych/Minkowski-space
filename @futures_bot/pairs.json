@@ -1,0 +1,56 @@
+{
+  "SBER": {
+    "enabled": true,
+    "spot": "SBER@MISX",
+    "futures": "SBER-9.26@FORTS",
+    "contango_coeff": 100
+  },
+  "GAZP": {
+    "enabled": true,
+    "spot": "GAZP@MISX",
+    "futures": "GAZP-9.26@FORTS",
+    "contango_coeff": 100
+  },
+  "ROSN": {
+    "enabled": true,
+    "spot": "ROSN@MISX",
+    "futures": "ROSN-9.26@FORTS",
+    "contango_coeff": 100
+  },
+  "LKOH": {
+    "enabled": true,
+    "spot": "LKOH@MISX",
+    "futures": "LKOH-9.26@FORTS",
+    "contango_coeff": 100
+  },
+  "VTBR": {
+    "enabled": true,
+    "spot": "VTBR@MISX",
+    "futures": "VTBR-9.26@FORTS",
+    "contango_coeff": 100
+  },
+  "GMKN": {
+    "enabled": true,
+    "spot": "GMKN@MISX",
+    "futures": "GMKN-9.26@FORTS",
+    "contango_coeff": 100
+  },
+  "ALRS": {
+    "enabled": true,
+    "spot": "ALRS@MISX",
+    "futures": "ALRS-9.26@FORTS",
+    "contango_coeff": 100
+  },
+  "AFLT": {
+    "enabled": true,
+    "spot": "AFLT@MISX",
+    "futures": "AFLT-9.26@FORTS",
+    "contango_coeff": 100
+  },
+  "MGNT": {
+    "enabled": true,
+    "spot": "MGNT@MISX",
+    "futures": "MGNT-9.26@FORTS",
+    "contango_coeff": 100
+  }
+}

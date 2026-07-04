@@ -1,0 +1,9 @@
+{
+    "api_secret": "your_api_secret_here",
+    "max_daily_orders": 190,
+    "bars_depth_days": 30,
+    "stocks": [
+        {"symbol": "SBER", "side": "BUY", "quantity": 1},
+        {"symbol": "GAZP", "side": "SELL", "quantity": 2}
+    ]
+}
