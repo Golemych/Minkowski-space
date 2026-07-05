@@ -151,8 +151,7 @@ class MinkowskiClassifier:
                 
                 if len(predictions) > self.neighbors_count:
                     percentile_idx = int(round(self.neighbors_count * 3 / 4))
-                    sorted_d = sorted(distances)
-                    last_distance = sorted_d[min(percentile_idx, len(sorted_d) - 1)]
+                    last_distance = distances[min(percentile_idx, len(distances) - 1)]
                     
                     distances.pop(0)
                     predictions.pop(0)
