@@ -1,177 +1,225 @@
-<h1 align="center">🤖 MOEX Trading Bots</h1>
+# MOEX Trading Bots
 
-> 🔥 **Две независимые алгоритмические стратегии для торговли на Московской бирже.** Классификация через пространство Минковского на акциях + Bollinger / Keltner с Contango-фильтром на фьючерсах. Finam Arena API (торговля) + MOEX ISS (данные). 
->
-> ⚡ **Первый заход — 7 дней данных. Дальше — только догрузка свежих свечей.** Parquet-кеш 1m свечей делает каждый цикл в 10+ раз быстрее.
->
-> 🏆 **Два робота в двух процессах — никаких конфликтов модулей.** Каждая стратегия живёт в своей изоляции.
+Два независимых алгоритмических робота для Московской биржи:
 
----
+- **🧲 @magnets_bot** — классификация свечных паттернов через метрику Минковского (акции MOEX)
+- **📈 @futures_bot** — пробой каналов Bollinger / Keltner с Contango-фильтром (фьючерсы MOEX)
 
-## 📋 Что это
-
-🎯 **Два робота для MOEX в одной папке.** Один торгует акции через ML-классификатор, второй — фьючерсы через пробой каналов с контанго-ранжированием. 
-
-🖥️ **Нативные Streamlit UI.** Каждая стратегия — отдельный процесс на своём порту. Открываешь два окна в браузере и мониторишь both.
-
-⚡ **Умный кеш 1m свечей.** Первый запуск грузит 7 дней данных (~5 сек на символ). Каждый следующий цикл — только свежие минуты (~0.1 сек). Никаких лишних запросов к MOEX ISS.
-
-🔒 **Конфиг на лету.** Режимы `On / Off / OnlyLong / OnlyShort`, параметры полос и каналов, лимиты рисков — меняются без перезапуска.
+Оба используют Finam Arena API (торговля) + MOEX ISS (исторические данные).  
+Каждый живёт в своей папке — никаких конфликтов модулей, можно запускать одновременно.
 
 ---
 
-## 🧠 Стратегии
+## Стратегии
 
-### 🧲 1. Пространство Минковского — акции
+### 🧲 @magnets_bot — Пространство Минковского (акции)
 
-Классификация свечных паттернов через метрику Минковского.
+Классификация на основе kNN в пространстве Минковского.
 
-| Компонент | Что делает |
-|---|---|
-| **5 фичей** | RSI, WT (WaveTrend), CCI, ADX, цена от ядра |
-| **Классификатор** | kNN в пространстве Минковского — взвешенная метрика на искажённом пространстве признаков |
-| **Фильтр тренда** | Kernel Regression — сглаживает шум, определяет направление |
-| **Торговля** | Сигналы BUY / SELL / CLOSE_LONG / CLOSE_SHORT |
+| Компонент | Описание |
+|-----------|----------|
+| **5 признаков** | RSI, WT (WaveTrend), CCI, ADX (+ второй RSI) |
+| **Классификатор** | kNN с метрикой Минковского, FIFO-буфер, динамический порог (75-й перцентиль) |
+| **Фильтры** | Kernel Regression (Rational Quadratic), волатильность (ATR₁ vs SMA₂₀), ADX |
+| **Выходы** | Strict (isHeldFourBars + isLastSignalBuy) или Dynamic (смена наклона ядра) |
+| **Нормализация** | Кумулятивная (expanding min/max) — точно по Pine Script MLExtensions |
+| **Сглаживание** | Wilder's RMA для RSI и ADX (не SMA) |
 
-### 📈 2. Bollinger / Keltner + Contango — фьючерсы
+**Сигналы:** `BUY` / `SELL` / `CLOSE_LONG` / `CLOSE_SHORT`
 
-Две независимые стратегии, работающие параллельно через общий ContangoFilter.
+**Инструменты:** 34 акции MOEX (список в `config.json` → `stocks`)
+
+---
+
+### 📈 @futures_bot — Bollinger / Keltner + Contango (фьючерсы)
+
+Два варианта стратегии, выбираемые per-pair в `pairs.json`:
 
 | Стратегия | Вход | Выход |
-|---|---|---|
-| **BollingerContangoStrategy** | Пробой верхней/нижней полосы Bollinger (200, 1.5) + contango stage | Цена заходит обратно за полосу |
-| **KeltnerContangoStrategy** | Пробой канала Keltner (EMA 140 + ATR 30, 2.6) + contango stage | Цена заходит обратно в канал |
+|-----------|------|-------|
+| **Bollinger** (230, 2.1) | Цена выше BB₊ или ниже BB₋ + contango stage | Цена с обратной стороны канала |
+| **Keltner** (EMA 150 + ATR 24, 3.9) | Цена выше KC₊ или ниже KC₋ + contango stage | Цена с обратной стороны канала |
 
-**ContangoFilter** — ранжирует все 10 пар по спреду фьючерс/спот. Топ-5 → только LONG, низ-5 → только SHORT, середина — не торгуем.
+**ContangoFilter** — ранжирование всех пар по спреду фьючерс/спот (через bid/ask из стакана):
+- TOP-N → только LONG (stage 1)
+- BOTTOM-N → только SHORT (stage 2)
+- Коэффициент контанго: авто `10^decimals`, особые правила для VTBR (20→100 с 15.07.2024) и GMKN (100→10 с 04.04.2024)
 
-**Формат тикеров:** новый MOEX формат `SBER-9.26@FORTS` (сентябрь 2026). Автоматическое определение экспирации — не входит в позицию за 3 дня до окончания контракта.
+**Дополнительно:**
+- Iceberg-ордера
+- Guard экспирации: вход 3–100 дней, выход <3 дня
+- Торговое окно: 10:05–18:30 MSK, только будни
 
----
-
-## 📊 Сравнение
-
-| | Минковский (акции) | Bollinger+Keltner (фьючерсы) |
-|---|---|---|
-| Инструменты | 10+ акций MOEX | 10 фьючерсных пар |
-| Таймфрейм | 15m | 15m |
-| Сигналы | BUY / SELL / CLOSE | BUY / SELL |
-| Фильтры | Kernel Regression | Contango ranking |
-| Риск-менеджмент | Hard Stop, Daily Limit, Drawdown | Hard Stop, Daily Limit, Drawdown |
-| Кеш | CSV | **Parquet** (в 10x быстрее) |
+**Инструменты:** 9 фьючерсных пар (SBER, GAZP, ROSN, LKOH, VTBR, GMKN, ALRS, AFLT, MGNT)
 
 ---
 
-## 🚀 Быстрый старт
+## Быстрый старт
 
-### 1. Установка
+### 1. Установка зависимостей
+
+```bash
+pip install -r requirements.txt  # если есть
+# Или вручную:
+pip install aiohttp pandas numpy streamlit plotly python-dotenv requests
+```
 
 ### 2. Настройка
 
-В файле `strategy_*/config.json` укажи свои:
-
-```json
-{
-  "api_secret": "твой_секрет_arena",
-  "account_id": "номер_счёта"
-}
-```
-
-### 3. Запуск UI (рекомендую)
+Скопируй и заполни конфиги:
 
 ```bash
-# Два окна в браузере одной командой
+# Для @magnets_bot
+cp @magnets_bot/config.example.json @magnets_bot/config.json
+# Отредактируй: api_secret, account_id, stocks
+
+# Для @futures_bot — .env уже есть
+# (ARENA_API_TOKEN и ARENA_ACCOUNT_ID в @futures_bot/.env)
+```
+
+**Важно:** В `.env` ключи должны называться `ARENA_API_TOKEN` и `ARENA_ACCOUNT_ID` (как в коде `main.py`).  
+Сейчас там `FINAM_API_TOKEN` / `FINAM_ACCOUNT_ID` — при первом запуске поправь название переменных.
+
+### 3. Запуск UI (рекомендуется)
+
+```bash
+# Оба сразу:
 python run_uis.py
 
-# Или по отдельности
-streamlit run @magnets_bot/app.py --server.port 8501   # акции
-streamlit run @futures_bot/app.py --server.port 8502   # фьючерсы
+# Или по отдельности:
+streamlit run @magnets_bot/app.py --server.port 8501
+streamlit run @futures_bot/app.py --server.port 8502
 ```
 
-Открывай:
-- **http://localhost:8501** 🧠 Минковский (акции)
-- **http://localhost:8502** 📈 Bollinger+Keltner (фьючерсы)
+- http://localhost:8501 — 🧲 Минковский (акции)
+- http://localhost:8502 — 📈 Bollinger+Keltner (фьючерсы)
 
-### 4. Запуск ботов (без UI, терминал)
+### 4. Запуск ботов (без UI)
 
 ```bash
-# Каждый отдельно
 python @magnets_bot/main.py
 python @futures_bot/main.py
 ```
 
 ---
 
-## 🏗 Архитектура
+## Архитектура проекта
 
 ```
-├── run_uis.py               # Запуск обоих Streamlit UI
+Minkowski-space/
 │
-├── @magnets_bot/            # 🧲 Пространство Минковского
-│   ├── app.py               #    Streamlit UI (порт 8501)
-│   ├── main.py              #    Торговый движок
-│   ├── strategy.py          #    Минковский-классификатор
-│   ├── arena.py             #    Arena API + MOEX ISS
-│   ├── indicators.py        #    RSI, WT, CCI, ADX, Kernel
-│   ├── config.example.json  #    Настройки
-│   └── .env.example         #    Переменные окружения
+├── @magnets_bot/                  # 🧲 Пространство Минковского (акции)
+│   ├── app.py                     #   Streamlit UI (порт 8501)
+│   ├── main.py                    #   Торговый движок (polling)
+│   ├── strategy.py                #   MinkowskiClassifier + StrategyManager
+│   ├── indicators.py              #   RSI, WT, CCI, ADX, Kernel Regression
+│   ├── arena_client.py            #   Arena API + MOEX ISS (sync, requests, CSV-кэш)
+│   ├── config.example.json        #   Пример конфига
+│   └── .env.example               #   Пример переменных
 │
-└── @futures_bot/            # 📈 Bollinger + Keltner + Contango
-    ├── app.py               #    Streamlit UI (порт 8502)
-    ├── main.py              #    Торговый движок
-    ├── arena.py             #    Arena API + MOEX ISS
-    ├── indicators.py        #    Bollinger, Keltner, Contango
-    ├── pairs.json           #    Список пар
-    ├── .env                 #    Переменные окружения
-    └── cache/               #    Parquet-кеш свечей
+├── @futures_bot/                  # 📈 Bollinger/Keltner + Contango (фьючерсы)
+│   ├── app.py                     #   Streamlit UI (порт 8502)
+│   ├── main.py                    #   Торговый движок (async polling)
+│   ├── arena.py                   #   Arena API + MOEX ISS (async, aiohttp, Parquet-кэш)
+│   ├── indicators.py              #   Bollinger, Keltner, ContangoCalculator, ContangoFilter
+│   ├── pairs.json                 #   Список фьючерсных пар со стратегиями
+│   ├── .env                       #   API-ключи
+│   ├── cache/                     #   Parquet-кэш 1m свечей
+│   ├── data/                      #   Дополнительные данные
+│   └── scripts/                   #   Вспомогательные скрипты
+│
+├── run_uis.py                     # Запуск обоих Streamlit UI
+├── README.md                      # Этот файл
+├── .gitignore
+└── ТЕОРЕТИЧЕСКАЯ БАЗА.md          # Теоретическое описание
 ```
-
-
-### Риск-менеджмент
-
-| Защита | Параметр | Дефолт |
-|---|---|---|
-| 🛑 Hard Stop Loss | `hard_stop_loss_pct` | -2% от капитала |
-| 📉 Drawdown Reduce | `drawdown_reduce_pct` | -5% → объём /2 |
-| ⛔ Drawdown Stop | `drawdown_stop_pct` | -10% → полная остановка |
-| 🔄 Daily Limit | `max_daily_orders` | 190 заявок в день |
 
 ---
 
-## 🔌 API
+## Сравнение стратегий
 
-| Источник | URL | Аутентификация |
+| | @magnets_bot | @futures_bot |
 |---|---|---|
-| **Arena API** (торговля) | `https://arena.finam.ru/v1` | Bearer token (`api_secret`) |
-| **MOEX ISS** (данные) | `https://iss.moex.com/iss` | Не требуется |
+| **Инструменты** | 34 акции MOEX | 9 фьючерсных пар |
+| **Таймфрейм** | 15m | 15m |
+| **Данные** | MOEX ISS (CSV-кэш) | MOEX ISS (Parquet-кэш) |
+| **API** | requests (sync) | aiohttp (async) |
+| **Сигналы** | BUY / SELL / CLOSE | BUY / SELL |
+| **Фильтр** | Kernel Regression + Volatility | Contango ranking (bid/ask) |
+| **Выход** | Strict (4 bars) / Dynamic | Обратная сторона канала / экспирация |
+| **Риск-менеджмент** | Hard Stop, Daily Limit, Drawdown | Hard Stop, Daily Limit, Drawdown |
 
-### Формат тикеров
+---
+
+## Параметры (defaults)
+
+### @futures_bot (`main.py`, константы)
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| `STRATEGY` | `"bollinger"` | Стратегия по умолчанию (переопределяется в `pairs.json`) |
+| `REGIME` | `"On"` | On / Off / OnlyLong / OnlyShort |
+| `BOLLINGER_LENGTH` | 230 | Период Bollinger |
+| `BOLLINGER_DEVIATION` | 2.1 | Множитель std для Bollinger |
+| `KELTNER_EMA_LENGTH` | 150 | Период EMA для Keltner |
+| `KELTNER_ATR_LENGTH` | 24 | Период ATR для Keltner |
+| `KELTNER_DEVIATION` | 3.9 | Множитель ATR для Keltner |
+| `ICEBERG_COUNT` | 1 | Количество айсберг-ордеров |
+| `VOLUME_VALUE` | 15.0 | % депозита на сделку |
+| `MIN_EXPIRATION_DAYS` | 3 | Мин. дней до экспирации для входа |
+| `MAX_EXPIRATION_DAYS` | 100 | Макс. дней до экспирации для входа |
+| `CONTANGO_FILTER_COUNT` | 5 | Пар в每组 stage |
+| `LOOP_SLEEP_SEC` | 60 | Пауза между циклами (сек) |
+
+### @magnets_bot (`config.json`)
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| `neighbors_count` | 8 | Число соседей kNN |
+| `feature_count` | 4 | Количество признаков (⚠ в примере 4, но features[] содержит 5) |
+| `use_kernel_filter` | true | Фильтр наклона ядра |
+| `use_volatility_filter` | true | Фильтр волатильности |
+| `use_dynamic_exits` | false | Динамические выходы (вместо strict) |
+| `volume_value` | 14.0 | % депозита на сделку |
+| `drawdown_stop_pct` | 0.3 | Остановка при просадке 30% |
+
+---
+
+## Формат тикеров
 
 ```
 Акции:     TICKER@MISX       → SBER@MISX
 Фьючерсы:  TICKER-MM.YY@FORTS → SBER-9.26@FORTS
-Старый:    SECID@FORTS        → SRU6@FORTS (тоже работает)
 ```
 
-### Маппинг SECID → новый формат
+---
 
-MOEX ISS принимает старые SECID (SRU6), но конфиг пишется в новом формате (SBER-9.26). Маппинг живёт в `arena_client.py`:
+## Риск-менеджмент
 
-| Тикер | SECID | SHORTNAME |
-|---|---|---|
-| SBER | SRU6 | SBRF-9.26 |
-| GAZP | GZU6 | GAZR-9.26 |
-| LKOH | LKU6 | LKOH-9.26 |
-и т.д.
+| Защита | @magnets_bot | @futures_bot |
+|--------|-------------|-------------|
+| Hard Stop Loss | -2% от капитала | -2% от капитала |
+| Drawdown Reduce | -5% → объём /2 | -5% → объём /2 |
+| Drawdown Stop | -30% → полная остановка | -10% → полная остановка |
+| Daily Limit | 190 заявок/день | 190 заявок/день |
 
 ---
 
-## 🧪 Советы
+## API
 
-- **Логи** в каждом `bot.py` пишут в stdout — видно в терминале
-- **Сделки** пишутся в `trades.csv` (CSV, можно открыть в Excel)
-- **Состояние** в `state.json` — обновляется каждый цикл для UI
-- **Hot reload** конфига — меняй параметры в `config.json` без перезапуска
-- **Остановка** — создай файл `stop.flag` в папке стратегии, бот остановится после текущего цикла
+| Источник | URL | Аутентификация |
+|----------|-----|---------------|
+| **Finam Arena** (торговля) | `https://arena.finam.ru/v1` | Bearer token |
+| **Finam API** (стакан) | `https://arena.finam.ru/v1/instruments/{symbol}/orderbook` | Bearer token |
+| **MOEX ISS** (данные) | `https://iss.moex.com/iss` | Не требуется |
 
 ---
 
+## Советы
+
+- **Логи** — stdout, видно в терминале
+- **Сделки** — `trades.csv` в папке каждой стратегии
+- **Состояние** — `state.json` для UI (обновляется каждый цикл)
+- **Hot reload** — `@magnets_bot` перечитывает `config.json` каждый цикл; `@futures_bot` — `pairs.json`
+- **Кэш** — Parquet (`@futures_bot`) / CSV (`@magnets_bot`) в `cache/`. Первый запуск загружает данные, следующие — только догрузка
+- **Остановка** — `touch stop.flag` в папке стратегии, бот остановится после текущего цикла
