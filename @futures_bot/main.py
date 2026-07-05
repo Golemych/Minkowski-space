@@ -1,15 +1,8 @@
-"""
-Combined Bollinger + Keltner + Contango futures strategy.
-Async, flat structure, State dataclass — matching Arena reference style.
-"""
-
 import asyncio
 import json
 import logging
-import math
 import os
 import signal
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -18,66 +11,64 @@ from typing import Optional
 import pandas as pd
 from dotenv import load_dotenv
 
-from arena import SIDE_BUY, SIDE_SELL, ArenaClient, OrderResult
+from arena import SIDE_BUY, SIDE_SELL, ArenaClient
 from indicators import Indicators, ContangoFilter, ContangoCalculator, normalize_df
 
-# ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 PAIRS_PATH = BASE_DIR / "pairs.json"
 CACHE_DIR = BASE_DIR / "cache"
 
-# ── Strategy parameters ────────────────────────────────────────────────────
-REGIME = "On"                       # On, OnlyLong, OnlyShort, Off
+STRATEGY = "bollinger"
+REGIME = "On"
 TIMEFRAME = "15m"
 BARS_DEPTH_DAYS = 7
 
-# Bollinger Bands
 BOLLINGER_LENGTH = 230
 BOLLINGER_DEVIATION = 2.1
 
-# Keltner Channel
 KELTNER_EMA_LENGTH = 150
 KELTNER_ATR_LENGTH = 24
 KELTNER_DEVIATION = 3.9
 
-# Contango filter
+CONTANGO_FILTER_REGIME = "On_MOEXStocksAuto"
 CONTANGO_FILTER_COUNT = 5
 CONTANGO_STAGE_LONG = 1
 CONTANGO_STAGE_SHORT = 2
 
-# Volume
-VOLUME_TYPE = "deposit_percent"     # deposit_percent | contracts | contract_currency
+VOLUME_TYPE = "deposit_percent"
 VOLUME_VALUE = 15.0
+TRADE_ASSET = "Prime"
 
-# Risk management
+ICEBERG_COUNT = 1
+
 MAX_DAILY_ORDERS = 190
 HARD_STOP_LOSS_PCT = 0.02
 DRAWDOWN_REDUCE_PCT = 0.05
 DRAWDOWN_STOP_PCT = 0.10
 
-# Trading hours (MSK)
 TRADE_START = dtime(10, 5)
 TRADE_END = dtime(18, 30)
 
-# Expiration guard (days)
 MIN_EXPIRATION_DAYS = 3
+MAX_EXPIRATION_DAYS = 100
 
-# Loop timing
-LOOP_SLEEP_SEC = 60                # seconds between full scan cycles
-RECONNECT_DELAY = 5
+LOOP_SLEEP_SEC = 60
 
-# ── Logging ────────────────────────────────────────────────────────────────
+DECIMALS_MAP = {
+    "SBER": 2, "SBERP": 2, "GAZP": 2, "ROSN": 2,
+    "LKOH": 2, "VTBR": 2, "GMKN": 2, "ALRS": 2,
+    "AFLT": 2, "MGNT": 2,
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("futures_combined")
+log = logging.getLogger("futures_bot")
 
 MSK = timezone(timedelta(hours=3))
 
-
-# ── Trading hours ──────────────────────────────────────────────────────────
 
 def _is_trading_time() -> bool:
     now = datetime.now(MSK)
@@ -86,8 +77,6 @@ def _is_trading_time() -> bool:
     t = now.time()
     return TRADE_START <= t < TRADE_END
 
-
-# ── Expiration ─────────────────────────────────────────────────────────────
 
 def _get_expiration(futures_symbol: str) -> Optional[datetime]:
     import re
@@ -112,17 +101,22 @@ def _days_to_expiration(futures_symbol: str) -> Optional[float]:
     return delta.total_seconds() / (24 * 3600)
 
 
-def _check_expiration(futures_symbol: str, min_days: int = MIN_EXPIRATION_DAYS) -> bool:
+def _check_expiration_range(futures_symbol: str) -> bool:
     days = _days_to_expiration(futures_symbol)
     if days is None:
         return True
-    if days < min_days:
-        log.info(f"Expiration {futures_symbol}: {days:.1f}d < {min_days}d")
+    if days < MIN_EXPIRATION_DAYS or days > MAX_EXPIRATION_DAYS:
+        log.info(f"Expiration {futures_symbol}: {days:.1f}d out of range")
         return False
     return True
 
 
-# ── Pairs loading ──────────────────────────────────────────────────────────
+def _check_expiration_exit(futures_symbol: str) -> bool:
+    days = _days_to_expiration(futures_symbol)
+    if days is None:
+        return False
+    return days < MIN_EXPIRATION_DAYS
+
 
 def load_pairs() -> list[dict]:
     if not PAIRS_PATH.exists():
@@ -130,7 +124,6 @@ def load_pairs() -> list[dict]:
         return []
     with open(PAIRS_PATH, encoding="utf-8") as f:
         raw = json.load(f)
-    # Accept both list-of-objects and dict-of-objects formats
     if isinstance(raw, list):
         return raw
     if isinstance(raw, dict):
@@ -142,134 +135,164 @@ def _enabled_pairs(pairs: list[dict]) -> list[dict]:
     return [p for p in pairs if p.get("enabled", True)]
 
 
-# ── Signal calculation ─────────────────────────────────────────────────────
+def calc_contango_coeff(ticker: str, decimals: int,
+                        now: Optional[datetime] = None) -> float:
+    if now is None:
+        now = datetime.now()
+    ticker_upper = ticker.upper()
+
+    if "VTB" in ticker_upper or "VTBR" in ticker_upper:
+        if now.year < 2024:
+            return 20
+        if now.year == 2024 and now.month < 7:
+            return 20
+        if now.year == 2024 and now.month == 7 and now.day < 15:
+            return 20
+        return 100
+
+    if "GMKN" in ticker_upper:
+        if now.year < 2024:
+            return 100
+        if now.year == 2024 and now.month < 4:
+            return 100
+        if now.year == 2024 and now.month == 4 and now.day < 4:
+            return 100
+        return 10
+
+    coeff = 1.0
+    for _ in range(decimals):
+        coeff *= 10
+    return coeff
+
 
 def calc_signal(
     ticker: str,
+    strategy: str,
     futures_symbol: str,
     spot_price: float,
     futures_price: float,
     futures_df: pd.DataFrame,
     contango_filter: ContangoFilter,
-    contango_coeff: float = 100.0,
+    contango_coeff: float,
 ) -> Optional[dict]:
-    """Combined Bollinger + Keltner signal (OR logic). Returns signal dict or None."""
-
     if not _is_trading_time():
         return None
-    if not _check_expiration(futures_symbol):
+    if not _check_expiration_range(futures_symbol):
         return None
 
     futures_df = normalize_df(futures_df)
-    min_len = max(BOLLINGER_LENGTH, KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH)
-    if len(futures_df) < min_len:
+
+    if strategy == "keltner":
+        min_len = max(KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH)
+        if len(futures_df) < min_len:
+            return None
+        k_u, k_m, k_l = Indicators.keltner_channel(
+            futures_df, KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH, KELTNER_DEVIATION
+        )
+        upper = float(k_u.iloc[-1])
+        lower = float(k_l.iloc[-1])
+        if any(pd.isna(x) for x in (upper, lower)):
+            return None
+        is_long = futures_price > upper
+        is_short = futures_price < lower
+        reason = f"KC 上={upper:.2f} 下={lower:.2f}"
+    else:
+        min_len = BOLLINGER_LENGTH
+        if len(futures_df) < min_len:
+            return None
+        bb_u, bb_m, bb_l = Indicators.bollinger_bands(
+            futures_df, BOLLINGER_LENGTH, BOLLINGER_DEVIATION
+        )
+        upper = float(bb_u.iloc[-1])
+        lower = float(bb_l.iloc[-1])
+        if any(pd.isna(x) for x in (upper, lower)):
+            return None
+        is_long = futures_price > upper
+        is_short = futures_price < lower
+        reason = f"BB 上={upper:.2f} 下={lower:.2f}"
+
+    if not is_long and not is_short:
         return None
 
-    # Bollinger
-    bb_u, bb_m, bb_l = Indicators.bollinger_bands(futures_df, BOLLINGER_LENGTH, BOLLINGER_DEVIATION)
-    # Keltner
-    k_u, k_m, k_l = Indicators.keltner_channel(
-        futures_df, KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH, KELTNER_DEVIATION
-    )
-
-    bb_upper = float(bb_u.iloc[-1])
-    bb_lower = float(bb_l.iloc[-1])
-    k_upper = float(k_u.iloc[-1])
-    k_lower = float(k_l.iloc[-1])
-
-    if any(pd.isna(x) for x in (bb_upper, bb_lower, k_upper, k_lower)):
-        return None
-
-    # ── Contango ────────────────────────────────────────────────────────
     contango_pct = ContangoCalculator.calculate(spot_price, futures_price, contango_coeff)
-    contango_filter.update(ticker, contango_pct)
     stage = contango_filter.get_stage(ticker, CONTANGO_FILTER_COUNT)
 
-    # ── Signals (OR) ────────────────────────────────────────────────────
-    signal = None
+    if is_long:
+        if REGIME == "Off" or REGIME == "OnlyShort":
+            return None
+        if stage != CONTANGO_STAGE_LONG:
+            return None
+        return {
+            "action": "BUY", "reason": reason,
+            "price": futures_price,
+            "contango_pct": contango_pct, "contango_stage": stage,
+        }
 
-    if futures_price > bb_upper or futures_price > k_upper:
-        if REGIME in ("On", "OnlyLong") and stage == CONTANGO_STAGE_LONG:
-            reasons = []
-            if futures_price > bb_upper:
-                reasons.append(f"BB={bb_upper:.2f}")
-            if futures_price > k_upper:
-                reasons.append(f"KC={k_upper:.2f}")
-            signal = {
-                "action": "BUY",
-                "reason": "UP " + " + ".join(reasons),
-                "price": futures_price,
-                "contango_pct": contango_pct,
-                "contango_stage": stage,
-                "bb_upper": bb_upper, "bb_lower": bb_lower,
-                "bb_middle": float(bb_m.iloc[-1]),
-                "k_upper": k_upper, "k_lower": k_lower,
-                "k_middle": float(k_m.iloc[-1]),
-            }
+    if is_short:
+        if REGIME == "Off" or REGIME == "OnlyLong":
+            return None
+        if stage != CONTANGO_STAGE_SHORT:
+            return None
+        return {
+            "action": "SELL", "reason": reason,
+            "price": futures_price,
+            "contango_pct": contango_pct, "contango_stage": stage,
+        }
 
-    elif futures_price < bb_lower or futures_price < k_lower:
-        if REGIME in ("On", "OnlyShort") and stage == CONTANGO_STAGE_SHORT:
-            reasons = []
-            if futures_price < bb_lower:
-                reasons.append(f"BB={bb_lower:.2f}")
-            if futures_price < k_lower:
-                reasons.append(f"KC={k_lower:.2f}")
-            signal = {
-                "action": "SELL",
-                "reason": "DOWN " + " + ".join(reasons),
-                "price": futures_price,
-                "contango_pct": contango_pct,
-                "contango_stage": stage,
-                "bb_upper": bb_upper, "bb_lower": bb_lower,
-                "bb_middle": float(bb_m.iloc[-1]),
-                "k_upper": k_upper, "k_lower": k_lower,
-                "k_middle": float(k_m.iloc[-1]),
-            }
-
-    return signal
+    return None
 
 
 def check_exit(
     ticker: str,
+    strategy: str,
     position_side: str,
     futures_df: pd.DataFrame,
     futures_price: float,
     futures_symbol: str,
 ) -> bool:
-    """Exit if price returned inside the opposite band of any channel, or expiration."""
-
-    if not _check_expiration(futures_symbol):
+    if _check_expiration_exit(futures_symbol):
         log.info(f"{ticker}: exit by expiration")
         return True
 
     futures_df = normalize_df(futures_df)
-    min_len = max(BOLLINGER_LENGTH, KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH)
-    if len(futures_df) < min_len:
-        return False
 
-    bb_u, _, bb_l = Indicators.bollinger_bands(futures_df, BOLLINGER_LENGTH, BOLLINGER_DEVIATION)
-    k_u, _, k_l = Indicators.keltner_channel(
-        futures_df, KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH, KELTNER_DEVIATION
-    )
+    if strategy == "keltner":
+        min_len = max(KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH)
+        if len(futures_df) < min_len:
+            return False
+        k_u, _, k_l = Indicators.keltner_channel(
+            futures_df, KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH, KELTNER_DEVIATION
+        )
+        upper = float(k_u.iloc[-1])
+        lower = float(k_l.iloc[-1])
+        if any(pd.isna(x) for x in (upper, lower)):
+            return False
+        if position_side == "BUY" and futures_price < lower:
+            log.info(f"{ticker}: exit LONG (price={futures_price:.2f} < KC下={lower:.2f})")
+            return True
+        if position_side == "SELL" and futures_price > upper:
+            log.info(f"{ticker}: exit SHORT (price={futures_price:.2f} > KC上={upper:.2f})")
+            return True
+    else:
+        min_len = BOLLINGER_LENGTH
+        if len(futures_df) < min_len:
+            return False
+        bb_u, _, bb_l = Indicators.bollinger_bands(
+            futures_df, BOLLINGER_LENGTH, BOLLINGER_DEVIATION
+        )
+        upper = float(bb_u.iloc[-1])
+        lower = float(bb_l.iloc[-1])
+        if any(pd.isna(x) for x in (upper, lower)):
+            return False
+        if position_side == "BUY" and futures_price < lower:
+            log.info(f"{ticker}: exit LONG (price={futures_price:.2f} < BB下={lower:.2f})")
+            return True
+        if position_side == "SELL" and futures_price > upper:
+            log.info(f"{ticker}: exit SHORT (price={futures_price:.2f} > BB上={upper:.2f})")
+            return True
 
-    bb_upper = float(bb_u.iloc[-1])
-    bb_lower = float(bb_l.iloc[-1])
-    k_upper = float(k_u.iloc[-1])
-    k_lower = float(k_l.iloc[-1])
-
-    if any(pd.isna(x) for x in (bb_upper, bb_lower, k_upper, k_lower)):
-        return False
-
-    if position_side == "BUY" and (futures_price < bb_lower or futures_price < k_lower):
-        log.info(f"{ticker}: exit LONG (price={futures_price:.2f} < BB={bb_lower:.2f}/KC={k_lower:.2f})")
-        return True
-    if position_side == "SELL" and (futures_price > bb_upper or futures_price > k_upper):
-        log.info(f"{ticker}: exit SHORT (price={futures_price:.2f} > BB={bb_upper:.2f}/KC={k_upper:.2f})")
-        return True
     return False
 
-
-# ── Position ───────────────────────────────────────────────────────────────
 
 @dataclass
 class Position:
@@ -283,7 +306,7 @@ class Position:
 
 @dataclass
 class State:
-    positions: dict = field(default_factory=dict)          # symbol → Position
+    positions: dict = field(default_factory=dict)
     total_pnl: float = 0.0
     trade_count: int = 0
     wins: int = 0
@@ -296,22 +319,19 @@ class State:
     pairs_cache: list[dict] = field(default_factory=list)
 
 
-# ── Volume ─────────────────────────────────────────────────────────────────
-
-def _calc_volume(price: float, balance: float) -> int:
+def _calc_volume(price: float, balance: float, lot: int = 1) -> int:
     if balance == 0 or price == 0:
         return 1
     if VOLUME_TYPE == "deposit_percent":
-        amount = balance * (VOLUME_VALUE / 100)
-        return max(1, int(amount / price))
+        money_on_pos = balance * (VOLUME_VALUE / 100)
+        qty = money_on_pos / price / lot
+        return max(1, int(round(qty)))
     elif VOLUME_TYPE == "contracts":
         return int(VOLUME_VALUE)
     elif VOLUME_TYPE == "contract_currency":
-        return max(1, int(VOLUME_VALUE / price))
+        return max(1, int(round(VOLUME_VALUE / price)))
     return 1
 
-
-# ── Trade execution ────────────────────────────────────────────────────────
 
 async def open_position(
     arena: ArenaClient,
@@ -327,10 +347,9 @@ async def open_position(
         qty = max(1, qty // 2)
 
     side = SIDE_BUY if signal["action"] == "BUY" else SIDE_SELL
-    label = f"{'BUY ' + signal['action']} {futures_symbol} ×{qty} @ {price:.4f}"
-
-    log.info(f"OPEN  {label}  [{signal['reason']}]  contango={signal['contango_pct']:.3f}%")
-    result = await arena.place_order(futures_symbol, side, qty)
+    log.info(f"OPEN  {signal['action']} {futures_symbol} ×{qty} @ {price:.4f}  [{signal['reason']}]  "
+             f"contango={signal['contango_pct']:.3f}%  iceberg={ICEBERG_COUNT}")
+    result = await arena.place_order(futures_symbol, side, qty, iceberg_count=ICEBERG_COUNT)
 
     if result:
         state.positions[futures_symbol] = Position(
@@ -359,7 +378,7 @@ async def close_position(
 ) -> bool:
     side = SIDE_SELL if pos.side == "BUY" else SIDE_BUY
     log.info(f"CLOSE [{reason}]  {pos.side} {futures_symbol} ×{pos.qty}")
-    result = await arena.place_order(futures_symbol, side, pos.qty)
+    result = await arena.place_order(futures_symbol, side, pos.qty, iceberg_count=ICEBERG_COUNT)
 
     if result:
         gross_pnl = (result.execution_price - pos.entry_price) * pos.qty
@@ -389,8 +408,6 @@ async def close_position(
         return False
 
 
-# ── Drawdown check ─────────────────────────────────────────────────────────
-
 def _check_drawdown(state: State, current_equity: float) -> str:
     if state.initial_equity is None or state.initial_equity == 0 or current_equity == 0:
         return "OK"
@@ -405,8 +422,6 @@ def _check_drawdown(state: State, current_equity: float) -> str:
     return "OK"
 
 
-# ── Summary ────────────────────────────────────────────────────────────────
-
 def _print_summary(state: State):
     log.info(
         "═══ FINAL SUMMARY ═══\n"
@@ -415,15 +430,11 @@ def _print_summary(state: State):
     )
 
 
-# ── Main loop ──────────────────────────────────────────────────────────────
-
 async def run_strategy(
     arena: ArenaClient,
     state: State,
     stop_event: asyncio.Event,
 ) -> None:
-    """Periodic scan: check signals, manage positions."""
-
     pairs = _enabled_pairs(load_pairs())
     if not pairs:
         log.error("No enabled pairs in pairs.json")
@@ -433,84 +444,90 @@ async def run_strategy(
 
     while not stop_event.is_set():
         try:
-            # ── Reload pairs ────────────────────────────────────────────────
             pairs = _enabled_pairs(load_pairs())
 
-            # ── Daily reset ─────────────────────────────────────────────────
             today = datetime.now(MSK).date()
             if state.last_reset_date != today:
                 state.daily_orders = 0
                 state.last_reset_date = today
                 log.info(f"Daily reset: orders=0")
 
-            # ── Account ────────────────────────────────────────────────────
             balance = await arena.get_balance()
             equity = await arena.get_equity()
             if state.initial_equity is None:
                 state.initial_equity = equity
                 log.info(f"Initial equity: {equity:,.2f}")
 
-            # ── Drawdown ────────────────────────────────────────────────────
             dd_status = _check_drawdown(state, equity)
             if dd_status == "STOP":
                 await asyncio.sleep(LOOP_SLEEP_SEC)
                 continue
 
-            # ── Open positions from Arena ───────────────────────────────────
             arena_positions = await arena.get_positions()
             arena_pos_by_sym = {p["symbol"]: p for p in arena_positions}
 
-            # ── Remove stale tracked positions ──────────────────────────────
             for sym in list(state.positions.keys()):
                 if sym not in arena_pos_by_sym:
                     log.warning(f"Position {sym} no longer in Arena, removing from state")
                     del state.positions[sym]
 
-            # ── Fetch data & evaluate ───────────────────────────────────────
             state.contango_filter = ContangoFilter()
 
+            contango_data = []
             for pair in pairs:
                 ticker = pair["ticker"]
                 spot_symbol = pair.get("spot")
                 futures_symbol = pair.get("futures")
-
                 if not spot_symbol or not futures_symbol:
                     continue
-
-                # Fetch bars (blocking MOEX ISS call in thread pool)
                 spot_df = await arena.get_bars(spot_symbol, TIMEFRAME, BARS_DEPTH_DAYS)
                 futures_df = await arena.get_bars(futures_symbol, TIMEFRAME, BARS_DEPTH_DAYS)
-
                 if spot_df is None or futures_df is None:
-                    log.warning(f"{ticker}: no data")
-                    continue
-
+                    log.warning(f"{ticker}: no data"); continue
                 spot_price = float(spot_df["close"].iloc[-1])
                 futures_price = float(futures_df["close"].iloc[-1])
 
-                # Update contango
-                coeff = float(pair.get("contango_coeff", 100))
-                cp = ContangoCalculator.calculate(spot_price, futures_price, coeff)
-                state.contango_filter.update(ticker, cp)
+                coeff = pair.get("contango_coeff")
+                if coeff is None:
+                    if CONTANGO_FILTER_REGIME == "On_MOEXStocksAuto":
+                        decimals = DECIMALS_MAP.get(ticker.upper(), 2)
+                        coeff = calc_contango_coeff(ticker, decimals)
+                    elif CONTANGO_FILTER_REGIME == "On_Manual":
+                        coeff = float(pair.get("manual_coeff", 100))
+                    else:
+                        coeff = 100.0
+                else:
+                    coeff = float(coeff)
 
-                # ── Open position? ──────────────────────────────────────────
+                spot_ask, _ = await arena.get_best_bid_ask(spot_symbol)
+                futures_bid, _ = await arena.get_best_bid_ask(futures_symbol)
+                if spot_ask is not None and futures_bid is not None:
+                    cp = ContangoCalculator.calculate(spot_ask, futures_bid, coeff)
+                else:
+                    cp = ContangoCalculator.calculate(spot_price, futures_price, coeff)
+                state.contango_filter.update(ticker, cp)
+                contango_data.append((pair, ticker, spot_symbol, futures_symbol,
+                                       spot_df, futures_df, spot_price, futures_price, coeff))
+
+            for (pair, ticker, spot_symbol, futures_symbol, spot_df, futures_df,
+                 spot_price, futures_price, coeff) in contango_data:
+                strategy = pair.get("strategy", STRATEGY)
+
                 if futures_symbol not in state.positions:
-                    cc = float(pair.get("contango_coeff", 100))
                     signal = calc_signal(
-                        ticker, futures_symbol, spot_price, futures_price,
-                        futures_df, state.contango_filter, cc,
+                        ticker, strategy, futures_symbol, spot_price, futures_price,
+                        futures_df, state.contango_filter, coeff,
                     )
                     if signal:
                         await open_position(arena, state, signal, futures_symbol,
                                             balance, dd_status == "REDUCE")
                 else:
-                    # ── Exit check ──────────────────────────────────────────
                     pos = state.positions[futures_symbol]
-                    if check_exit(ticker, pos.side, futures_df, futures_price, futures_symbol):
+                    if check_exit(ticker, strategy, pos.side, futures_df,
+                                  futures_price, futures_symbol):
                         await close_position(arena, state, futures_symbol,
                                              "Exit by signal", pos, futures_price)
 
-            # ── Hard stop loss on open Arena positions ──────────────────────
             if state.initial_equity and state.initial_equity > 0:
                 for sym, apos in arena_pos_by_sym.items():
                     pnl = apos.get("unrealized_pnl", 0)
@@ -522,7 +539,6 @@ async def run_strategy(
                             await close_position(arena, state, sym,
                                                  f"Hard Stop {pnl_pct*100:.2f}%", pos, 0.0)
 
-            # ── Status log ──────────────────────────────────────────────────
             log.info(
                 f"Cycle done: equity={equity:,.0f}  positions={len(state.positions)}  "
                 f"orders_today={state.daily_orders}  total_pnl={state.total_pnl:+.2f}"
@@ -533,14 +549,11 @@ async def run_strategy(
         except Exception as exc:
             log.error(f"Cycle error: {exc}", exc_info=True)
 
-        # ── Sleep between cycles ───────────────────────────────────────────
         for _ in range(LOOP_SLEEP_SEC):
             if stop_event.is_set():
                 return
             await asyncio.sleep(1)
 
-
-# ── Entry point ────────────────────────────────────────────────────────────
 
 async def main() -> None:
     load_dotenv(BASE_DIR / ".env")
@@ -554,16 +567,14 @@ async def main() -> None:
     account_id = int(account_id_str)
 
     log.info(
-        "Futures Combined Strategy starting\n"
+        f"Futures Strategy  strategy={STRATEGY}\n"
         f"Bollinger: {BOLLINGER_LENGTH}/{BOLLINGER_DEVIATION}  "
         f"Keltner: {KELTNER_EMA_LENGTH}/{KELTNER_ATR_LENGTH}/{KELTNER_DEVIATION}\n"
-        f"Contango: top={CONTANGO_FILTER_COUNT}  long_stage={CONTANGO_STAGE_LONG}"
-        f"  short_stage={CONTANGO_STAGE_SHORT}\n"
+        f"Contango: regime={CONTANGO_FILTER_REGIME}  count={CONTANGO_FILTER_COUNT}\n"
         f"Regime={REGIME}  Vol={VOLUME_TYPE}={VOLUME_VALUE}  "
-        f"MaxOrders={MAX_DAILY_ORDERS}/d\n"
-        f"Trade hours: {TRADE_START.strftime('%H:%M')}–{TRADE_END.strftime('%H:%M')} MSK  "
-        f"Expiration guard: {MIN_EXPIRATION_DAYS}d\n"
-        f"Orders: Arena REST (account={account_id})"
+        f"Iceberg={ICEBERG_COUNT}  MaxOrders={MAX_DAILY_ORDERS}/d\n"
+        f"Trade: {TRADE_START.strftime('%H:%M')}–{TRADE_END.strftime('%H:%M')} MSK  "
+        f"Expiration: {MIN_EXPIRATION_DAYS}d–{MAX_EXPIRATION_DAYS}d"
     )
 
     state = State()
@@ -574,7 +585,6 @@ async def main() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop_event.set)
     except NotImplementedError:
-        # Windows: no add_signal_handler, KeyboardInterrupt works via CancelledError
         pass
 
     try:

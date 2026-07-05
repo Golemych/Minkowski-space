@@ -3,54 +3,54 @@
     "enabled": true,
     "spot": "SBER@MISX",
     "futures": "SBER-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   },
   "GAZP": {
     "enabled": true,
     "spot": "GAZP@MISX",
     "futures": "GAZP-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   },
   "ROSN": {
     "enabled": true,
     "spot": "ROSN@MISX",
     "futures": "ROSN-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   },
   "LKOH": {
     "enabled": true,
     "spot": "LKOH@MISX",
     "futures": "LKOH-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   },
   "VTBR": {
     "enabled": true,
     "spot": "VTBR@MISX",
     "futures": "VTBR-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   },
   "GMKN": {
     "enabled": true,
     "spot": "GMKN@MISX",
     "futures": "GMKN-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   },
   "ALRS": {
     "enabled": true,
     "spot": "ALRS@MISX",
     "futures": "ALRS-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   },
   "AFLT": {
     "enabled": true,
     "spot": "AFLT@MISX",
     "futures": "AFLT-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   },
   "MGNT": {
     "enabled": true,
     "spot": "MGNT@MISX",
     "futures": "MGNT-9.26@FORTS",
-    "contango_coeff": 100
+    "strategy": "bollinger"
   }
 }

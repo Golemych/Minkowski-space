@@ -1,10 +1,4 @@
-"""
-Finam Arena REST client + MOEX ISS data provider.
-Async, auto JWT refresh, OrderResult dataclass.
-"""
-
 import asyncio
-import json
 import logging
 import re
 import time
@@ -16,7 +10,7 @@ from typing import Optional
 import aiohttp
 import pandas as pd
 
-log = logging.getLogger("futures_combined.arena")
+log = logging.getLogger("futures_bot.arena")
 
 SIDE_BUY = "SIDE_BUY"
 SIDE_SELL = "SIDE_SELL"
@@ -34,8 +28,6 @@ class OrderResult:
     execution_price: float
     commission: float
 
-
-# ── MOEX ISS helpers (sync, blocking) ──────────────────────────────────────
 
 MOEX_BASE = "https://iss.moex.com/iss"
 MOEX_SUPPORTED_INTERVALS = {1, 10, 60, 24, 7, 31}
@@ -83,13 +75,11 @@ def _get_moex_market_info(symbol: str) -> dict:
 
 def _fetch_1m_candles_sync(symbol: str, days: int,
                             cache_dir: Path) -> Optional[pd.DataFrame]:
-    """Blocking MOEX ISS 1m fetch with parquet cache."""
     import requests as sync_requests
 
     cache_path = cache_dir / f"{_clean_symbol(symbol)}_1m.parquet"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Try loading from cache first
     if cache_path.exists():
         try:
             df = pd.read_parquet(cache_path)
@@ -184,11 +174,7 @@ def _aggregate_1m(df_1m: pd.DataFrame, target_minutes: int) -> pd.DataFrame:
     }).dropna()
 
 
-# ── Async Arena client ─────────────────────────────────────────────────────
-
 class ArenaClient:
-    """Async Arena REST client with auto JWT refresh + MOEX ISS data."""
-
     def __init__(self, api_token: str, account_id: int,
                  cache_dir: Optional[Path] = None) -> None:
         self._api_token = api_token
@@ -231,13 +217,16 @@ class ArenaClient:
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self._jwt}"}
 
-    async def place_order(self, symbol: str, side: str, qty: int) -> Optional[OrderResult]:
+    async def place_order(self, symbol: str, side: str, qty: int,
+                          iceberg_count: int = 0) -> Optional[OrderResult]:
         await self._ensure_token()
         payload = {
             "symbol": symbol,
             "side": side,
             "quantity": {"value": str(qty)},
         }
+        if iceberg_count > 1:
+            payload["iceberg"] = iceberg_count
         try:
             async with self._session.post(
                 f"/v1/accounts/{self.account_id}/orders",
@@ -313,6 +302,60 @@ class ArenaClient:
                 continue
         return positions
 
+    async def get_asset(self, symbol: str) -> Optional[dict]:
+        await self._ensure_token()
+        try:
+            async with self._session.get(
+                f"/v1/assets/{symbol}",
+                params={"account_id": str(self.account_id)},
+                headers=self._headers(),
+            ) as resp:
+                if not resp.ok:
+                    return None
+                return await resp.json()
+        except Exception as exc:
+            log.error(f"Arena get_asset error {symbol}: {exc}")
+            return None
+
+    async def get_decimals(self, symbol: str) -> int:
+        asset = await self.get_asset(symbol)
+        if asset:
+            return int(asset.get("decimals", 2))
+        return 2
+
+    async def get_orderbook(self, symbol: str) -> Optional[dict]:
+        await self._ensure_token()
+        try:
+            async with self._session.get(
+                f"/v1/instruments/{symbol}/orderbook",
+                headers=self._headers(),
+            ) as resp:
+                if not resp.ok:
+                    return None
+                return await resp.json()
+        except Exception as exc:
+            log.error(f"Arena get_orderbook error {symbol}: {exc}")
+            return None
+
+    async def get_best_bid_ask(self, symbol: str) -> tuple[Optional[float], Optional[float]]:
+        ob = await self.get_orderbook(symbol)
+        if ob is None:
+            return None, None
+        rows = ob.get("orderbook", {}).get("rows", [])
+        best_bid = None
+        best_ask = None
+        for row in rows:
+            price = float(row.get("price", {}).get("value", 0))
+            buy_size = float(row.get("buy_size", {}).get("value", 0))
+            sell_size = float(row.get("sell_size", {}).get("value", 0))
+            if buy_size > 0 and best_bid is None:
+                best_bid = price
+            if sell_size > 0 and best_ask is None:
+                best_ask = price
+            if best_bid is not None and best_ask is not None:
+                break
+        return best_bid, best_ask
+
     async def get_bars(self, symbol: str, timeframe: str = "15m",
                        days: int = 30) -> Optional[pd.DataFrame]:
         target_min = TIMEFRAME_MINUTES.get(timeframe)
@@ -322,7 +365,6 @@ class ArenaClient:
 
         fetch_days = min(days, 30)
 
-        # Run blocking MOEX ISS call in thread pool
         loop = asyncio.get_running_loop()
         df_1m = await loop.run_in_executor(
             None, _fetch_1m_candles_sync, symbol, fetch_days, self._cache_dir

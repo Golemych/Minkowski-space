@@ -1,14 +1,8 @@
-"""
-Streamlit UI for Combined Bollinger + Keltner + Contango strategy.
-"""
-
 import asyncio
 import json
 import os
 import subprocess
 import sys
-import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
@@ -21,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 os.chdir(Path(__file__).parent)
 
 from arena import ArenaClient
-from indicators import Indicators, ContangoFilter, ContangoCalculator
+from indicators import Indicators
 
 BASE_DIR = Path(__file__).parent
 PAIRS_PATH = BASE_DIR / "pairs.json"
@@ -34,6 +28,11 @@ BOLLINGER_DEVIATION = 2.1
 KELTNER_EMA_LENGTH = 150
 KELTNER_ATR_LENGTH = 24
 KELTNER_DEVIATION = 3.9
+DECIMALS_MAP = {
+    "SBER": 2, "SBERP": 2, "GAZP": 2, "ROSN": 2,
+    "LKOH": 2, "VTBR": 2, "GMKN": 2, "ALRS": 2,
+    "AFLT": 2, "MGNT": 2,
+}
 
 
 def _load_pairs() -> dict:
@@ -59,20 +58,32 @@ def _run_async(coro):
     return asyncio.run(coro)
 
 
-st.set_page_config(page_title="Futures Combined Bot", layout="wide")
-st.title("Futures Combined: Bollinger + Keltner + Contango")
+def _calc_contango_coeff(ticker: str) -> float:
+    ticker_upper = ticker.upper()
+    now = datetime.now()
+    if "VTB" in ticker_upper or "VTBR" in ticker_upper:
+        if now.year < 2024: return 20
+        if now.year == 2024 and (now.month < 7 or (now.month == 7 and now.day < 15)): return 20
+        return 100
+    if "GMKN" in ticker_upper:
+        if now.year < 2024: return 100
+        if now.year == 2024 and (now.month < 4 or (now.month == 4 and now.day < 4)): return 100
+        return 10
+    decimals = DECIMALS_MAP.get(ticker_upper, 2)
+    return 10 ** decimals
+
+
+st.set_page_config(page_title="Futures Bot", layout="wide")
+st.title("Futures Bot")
 
 pairs = _load_pairs()
 tab = st.sidebar.radio("Section", ["Dashboard", "Charts", "Pairs", "Trades", "Safety"])
 
-# ── DASHBOARD ──────────────────────────────────────────────────────────────
 if tab == "Dashboard":
     st.header("Account & Status")
     client = _get_client()
 
-    # ── Bot control ─────────────────────────────────────────────────────
     bot_pid_path = BASE_DIR / ".bot.pid"
-
     is_running = bot_pid_path.exists()
     try:
         if is_running:
@@ -88,7 +99,7 @@ if tab == "Dashboard":
     with col_a:
         if is_running:
             st.success(f"Bot is running (PID {bot_pid_path.read_text().strip()})")
-            if st.button("⏹ Stop bot"):
+            if st.button("Stop bot"):
                 try:
                     pid = int(bot_pid_path.read_text().strip())
                     subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True)
@@ -98,7 +109,7 @@ if tab == "Dashboard":
                     st.error("Failed to stop")
         else:
             bot_pid_path.unlink(missing_ok=True)
-            if st.button("▶️ Start bot"):
+            if st.button("Start bot"):
                 proc = subprocess.Popen(
                     [sys.executable, "-u", "main.py"],
                     cwd=str(BASE_DIR),
@@ -116,7 +127,6 @@ if tab == "Dashboard":
         else:
             st.metric("Trades", "0")
 
-    # ── Account ─────────────────────────────────────────────────────────
     with st.spinner("Loading account..."):
         try:
             acc = _run_async(client.get_account())
@@ -155,9 +165,8 @@ if tab == "Dashboard":
         except Exception as e:
             st.error(f"Account load failed: {e}")
 
-# ── CHARTS ─────────────────────────────────────────────────────────────────
 elif tab == "Charts":
-    st.header("Charts with Bollinger + Keltner")
+    st.header("Charts")
 
     if not pairs:
         st.warning("No pairs configured in pairs.json")
@@ -165,6 +174,7 @@ elif tab == "Charts":
 
     ticker = st.selectbox("Instrument", list(pairs.keys()))
     pair = pairs[ticker]
+    strategy = pair.get("strategy", "bollinger")
     spot_sym = pair.get("spot", ticker)
     futures_sym = pair.get("futures", "")
 
@@ -181,22 +191,30 @@ elif tab == "Charts":
 
     df.columns = [c.lower() for c in df.columns]
 
-    bb_u, bb_m, bb_l = Indicators.bollinger_bands(df, BOLLINGER_LENGTH, BOLLINGER_DEVIATION)
-    k_u, k_m, k_l = Indicators.keltner_channel(df, KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH, KELTNER_DEVIATION)
-
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
         x=df.index, open=df["open"], high=df["high"],
         low=df["low"], close=df["close"], name=sym,
     ))
-    fig.add_trace(go.Scatter(x=df.index, y=bb_u, mode="lines",
-                             name="BB Upper", line=dict(color="blue", dash="dash")))
-    fig.add_trace(go.Scatter(x=df.index, y=bb_l, mode="lines",
-                             name="BB Lower", line=dict(color="blue", dash="dash")))
-    fig.add_trace(go.Scatter(x=df.index, y=k_u, mode="lines",
-                             name="KC Upper", line=dict(color="orange", dash="dot")))
-    fig.add_trace(go.Scatter(x=df.index, y=k_l, mode="lines",
-                             name="KC Lower", line=dict(color="orange", dash="dot")))
+
+    if strategy == "keltner":
+        k_u, k_m, k_l = Indicators.keltner_channel(df, KELTNER_EMA_LENGTH, KELTNER_ATR_LENGTH, KELTNER_DEVIATION)
+        fig.add_trace(go.Scatter(x=df.index, y=k_u, mode="lines",
+                                 name="KC Upper", line=dict(color="orange", dash="dot")))
+        fig.add_trace(go.Scatter(x=df.index, y=k_m, mode="lines",
+                                 name="KC Mid", line=dict(color="orange", width=1)))
+        fig.add_trace(go.Scatter(x=df.index, y=k_l, mode="lines",
+                                 name="KC Lower", line=dict(color="orange", dash="dot")))
+        strategy_label = "Keltner"
+    else:
+        bb_u, bb_m, bb_l = Indicators.bollinger_bands(df, BOLLINGER_LENGTH, BOLLINGER_DEVIATION)
+        fig.add_trace(go.Scatter(x=df.index, y=bb_u, mode="lines",
+                                 name="BB Upper", line=dict(color="blue", dash="dash")))
+        fig.add_trace(go.Scatter(x=df.index, y=bb_m, mode="lines",
+                                 name="BB Mid", line=dict(color="blue", width=1)))
+        fig.add_trace(go.Scatter(x=df.index, y=bb_l, mode="lines",
+                                 name="BB Lower", line=dict(color="blue", dash="dash")))
+        strategy_label = "Bollinger"
 
     fig.update_layout(template="plotly_dark", height=600,
                       xaxis_rangeslider_visible=False)
@@ -204,23 +222,30 @@ elif tab == "Charts":
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Price", f"{df['close'].iloc[-1]:.2f}")
-    c2.metric("BB Upper", f"{bb_u.iloc[-1]:.2f}" if not pd.isna(bb_u.iloc[-1]) else "—")
-    c3.metric("BB Lower", f"{bb_l.iloc[-1]:.2f}" if not pd.isna(bb_l.iloc[-1]) else "—")
+    c2.metric("Strategy", strategy_label)
+    coeff = _calc_contango_coeff(ticker)
+    c3.metric("Contango coeff", coeff)
     c4.metric("Bars", len(df))
 
-# ── PAIRS ──────────────────────────────────────────────────────────────────
 elif tab == "Pairs":
     st.header("Futures pairs")
 
     to_delete = []
     for ticker, data in list(pairs.items()):
-        c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 1, 1])
+        c1, c2, c3, c4, c5, c6 = st.columns([1, 1.5, 1.5, 1, 1, 1])
         c1.write(f"**{ticker}**")
         data["spot"] = c2.text_input("Spot", data.get("spot", ""), key=f"sp_{ticker}")
         data["futures"] = c3.text_input("Futures", data.get("futures", ""), key=f"fu_{ticker}")
-        data["contango_coeff"] = c4.number_input("Coeff", float(data.get("contango_coeff", 100)), key=f"co_{ticker}")
-        data["enabled"] = c5.checkbox("On", data.get("enabled", True), key=f"en_{ticker}")
-        if st.button("🗑", key=f"del_{ticker}"):
+        opts = {"bollinger": "Bollinger", "keltner": "Keltner"}
+        current = data.get("strategy", "bollinger")
+        data["strategy"] = c4.selectbox("Strategy", list(opts.keys()),
+                                         format_func=lambda x: opts[x],
+                                         index=list(opts.keys()).index(current) if current in opts else 0,
+                                         key=f"st_{ticker}")
+        coeff = _calc_contango_coeff(ticker)
+        c5.metric("Coeff", f"{coeff:.0f}")
+        data["enabled"] = c6.checkbox("On", data.get("enabled", True), key=f"en_{ticker}")
+        if st.button("Delete", key=f"del_{ticker}"):
             to_delete.append(ticker)
 
     for t in to_delete:
@@ -228,13 +253,13 @@ elif tab == "Pairs":
 
     st.divider()
     with st.expander("Add pair"):
-        c1, c2, c3, c4 = st.columns([1, 2, 2, 1])
+        c1, c2, c3, c4 = st.columns([1, 1.5, 1.5, 1])
         nt = c1.text_input("Ticker", placeholder="SBER")
         ns = c2.text_input("Spot", placeholder="SBER@MISX")
         nf = c3.text_input("Futures", placeholder="SBER-9.26@FORTS")
-        nc = c4.number_input("Coeff", 100.0)
+        ns_strat = c4.selectbox("Strategy", ["bollinger", "keltner"])
         if st.button("Add") and nt:
-            pairs[nt] = {"spot": ns, "futures": nf, "contango_coeff": nc, "enabled": True}
+            pairs[nt] = {"spot": ns, "futures": nf, "strategy": ns_strat, "enabled": True}
             _save_pairs(pairs)
             st.success(f"Added {nt}")
             st.rerun()
@@ -243,7 +268,6 @@ elif tab == "Pairs":
         _save_pairs(pairs)
         st.success(f"Saved {len(pairs)} pairs")
 
-# ── TRADES ─────────────────────────────────────────────────────────────────
 elif tab == "Trades":
     st.header("Trades log")
     path = BASE_DIR / "trades.csv"
@@ -261,7 +285,6 @@ elif tab == "Trades":
     else:
         st.info("No trades yet")
 
-# ── SAFETY ─────────────────────────────────────────────────────────────────
 elif tab == "Safety":
     st.header("Emergency position close")
     st.warning("Closes ALL open positions at market!")
