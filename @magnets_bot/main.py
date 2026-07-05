@@ -1,273 +1,549 @@
-import asyncio
-from datetime import datetime
-from dataclasses import dataclass
+"""
+Главный торговый бот для стратегии Минковского (акции MOEX)
+
+Архитектура:
+- StrategyManager: единая стратегия классификации Минковского
+- Возвращает действия: BUY, SELL, CLOSE_LONG, CLOSE_SHORT или None
+- Горячая перезагрузка config.json
+- Риск-менеджмент: Hard Stop, Daily Limit, Drawdown Control
+
+Файлы:
+- config.json: настройки (перезагружается каждый цикл)
+- state.json: состояние бота для UI
+- trades.csv: лог сделок (append mode)
+- positions_state.json: маппинг позиций к стратегии
+- stop.flag: сигнал для остановки
+"""
+
 import json
+import time
+import logging
 import os
-import sys
-from pathlib import Path
-from typing import Optional, List, Dict
+from datetime import datetime
+from typing import Optional, Dict
+from arena_client import ArenaClient
+from strategy import StrategyManager
+from indicators import normalize_df
 
-# Commented out external dependencies for portability
-# import aiohttp  # HTTP requests
-# import pandas as pd  # Data handling
-# import plotly.graph_objects as go  # Charting
-# import streamlit as st  # UI framework
-# from dotenv import load_dotenv  # Environment variables
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Arena client stub (simplified for compatibility)
-class ArenaClient:
-    def __init__(self, api_token: str, account_id: int, cache_dir: str):
-        self.api_token = api_token
-        self.account_id = account_id
-        self.cache_dir = cache_dir
-        print("ArenaClient initialized - placeholder for HTTP client")
+CONFIG_PATH = "config.json"
+TRADES_PATH = "trades.csv"
+STATE_PATH = "state.json"
+STOP_FLAG = "stop.flag"
+POSITIONS_STATE = "positions_state.json"
+STRATEGY_NAME = "MK"  # Имя стратегии для логов и CSV
 
-    async def get_account(self) -> Optional[Dict]:
-        print("ArenaClient.get_account called - placeholder implementation")
-        return {
-            "available_cash": {"value": 1000000},
-            "equity": {"value": 1200000},
-            "cash": {"value": 500000}
-        }
 
-    async def get_positions(self) -> Optional[List[Dict]]:
-        print("ArenaClient.get_positions called - placeholder implementation")
-        return [
-            {"symbol": "SBER", "side": "BUY", "quantity": 10, "avg_price": 250.0, "unrealized_pnl": 500.0}
-        ]
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
 
-    async def get_bars(self, symbol: str, timeframe: str, days: int) -> Optional[List[Dict]]:
-        print(f"ArenaClient.get_bars called - placeholder for {symbol} - placeholder implementation")
-        return []
+def log_trade(ticker: str, side: str, price: float, volume: int,
+              reason: str = "", pnl: float = 0):
+    """Запись сделки в CSV (append mode)"""
+    file_exists = os.path.exists(TRADES_PATH)
+    try:
+        with open(TRADES_PATH, 'a', newline='', encoding='utf-8') as f:
+            if not file_exists:
+                f.write("timestamp,ticker,side,price,volume,strategy,reason,pnl\n")
+            row = (
+                f"{datetime.now().isoformat()},"
+                f"{ticker},"
+                f"{side},"
+                f"{price:.4f},"
+                f"{volume},"
+                f"{STRATEGY_NAME},"
+                f"\"{reason}\","
+                f"{pnl:.2f}\n"
+            )
+            f.write(row)
+    except Exception as e:
+        logger.error(f"❌ Ошибка записи сделки: {e}")
 
-    async def place_order(self, symbol: str, side: str, qty: int) -> Optional[Dict]:
-        print(f"ArenaClient.place_order called - placeholder for {symbol} - placeholder implementation")
-        return {"order_id": "PLACEHOLDER", "status": "PLACED", "symbol": symbol, "side": side, "quantity": qty, "price": 0.0}
 
-# Indicator functions (simplified)
-def normalize_df(df):
-    print("normalize_df called - placeholder implementation")
-    return df
+def update_state(data: dict):
+    """Обновление state.json для UI"""
+    try:
+        with open(STATE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления state.json: {e}")
 
-class KernelRegression:
-    def __init__(self, bandwidth: float):
-        self.bandwidth = bandwidth
-        print("KernelRegression initialized - placeholder implementation")
 
-class Filters:
-    @staticmethod
-    def moving_average(df, window: int):
-        print("Filters.moving_average called - placeholder implementation")
-        return []
-
-# Strategy components (simplified)
-class MinkowskiClassifier:
-    def predict(self, data):
-        print("MinkowskiClassifier.predict called - placeholder implementation")
-        return "BUY"
-
-class StrategyManager:
-    def __init__(self, classifier):
-        self.classifier = classifier
-
-    def generate_signals(self, data_dict):
-        print("StrategyManager.generate_signals called - placeholder implementation")
-        return {"SBER": "BUY", "GAZP": "SELL"}
-
-# Core configuration and state management
-BASE_DIR = Path(__file__).parent
-CONFIG_PATH = BASE_DIR / "config.json"
-TRADES_PATH = BASE_DIR / "trades.csv"
-STATE_PATH = BASE_DIR / "state.json"
-STRATEGY_NAME = "MK"
-
-@dataclass
-class State:
-    status: str = "IDLE"
-    balance: float = 0.0
-    equity: float = 0.0
-    cash: float = 0.0
-    available_cash: float = 0.0
-    open_positions: int = 0
-    daily_orders: int = 0
-    drawdown_pct: float = 0.0
-    last_signals: List[str] = None
-    last_errors: List[str] = None
-    stats: Dict[str, int] = None
-    positions_owners: Dict[str, str] = None
-    last_update: str = None
-
-# Configuration and state management
-def load_config() -> dict:
-    if os.path.exists(CONFIG_PATH):
+def load_positions_state() -> Dict:
+    """Загрузка маппинга открытых позиций"""
+    if os.path.exists(POSITIONS_STATE):
         try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            with open(POSITIONS_STATE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except Exception as e:
-            print(f"❌ Ошибка загрузки конфигурации: {e}")
+        except Exception:
             pass
     return {}
 
-def save_config(cfg: dict):
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-    print("✅ Конфигурация сохранена")
 
-def load_state() -> State:
-    if os.path.exists(STATE_PATH):
-        try:
-            with open(STATE_PATH, 'r', encoding='utf-8') as f:
-                return State(**json.load(f))
-        except Exception as e:
-            print(f"❌ Ошибка загрузки состояния: {e}")
-            pass
-    return State()
-
-def save_state(state: State):
-    with open(STATE_PATH, 'w', encoding='utf-8') as f:
-        json.dump(state.__dict__, f, indent=2, ensure_ascii=False)
-    print("✅ Состояние сохранено")
-
-def format_rub(value) -> str:
-    return f"{value:,.0f} ₽"
-
-# Mock environment for demonstration
-def _setup_mock_environment():
-    if not os.path.exists(BASE_DIR / ".env"):
-        with open(BASE_DIR / ".env", "w") as f:
-            f.write("""ARENA_API_TOKEN=demo_token_for_development
-ARENA_ACCOUNT_ID=1000000
-""")
-        print("✅ Создан .env файл для разработки")
-    if not os.path.exists(BASE_DIR / "config.json"):
-        config = {
-            "api_secret": "demo_secret_for_development",
-            "account_id": 1000000,
-            "max_daily_orders": 190,
-            "bars_depth_days": 30,
-            "stocks": [
-                {"symbol": "SBER", "side": "BUY", "quantity": 1},
-                {"symbol": "GAZP", "side": "SELL", "quantity": 2}
-            ],
-            "drawdown_threshold": 0.05
-        }
-        with open(BASE_DIR / "config.json", "w") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        print("✅ Создан config.json файл")
-    if not os.path.exists(BASE_DIR / "trades.csv"):
-        with open(BASE_DIR / "trades.csv", "w") as f:
-            f.write("date,symbol,side,quantity,price\n2025-07-01,SBER,BUY,10,250.0\n")
-        print("✅ Создан trades.csv файл")
-
-# Main bot logic
-async def _load_account_state(state: State):
-    client = ArenaClient("demo_token", 1000000, BASE_DIR / "cache")
-    info = await client.get_account()
-    positions = await client.get_positions()
-
-    if info:
-        state.status = "IDLE"
-        state.balance = float(info.get("available_cash", {}).get("value", 0))
-        state.equity = float(info.get("equity", {}).get("value", 0))
-        state.cash = float(info.get("cash", {}).get("value", 0))
-        state.available_cash = float(info.get("available_cash", {}).get("value", 0))
-        state.open_positions = len(positions)
-        state.last_update = datetime.now().isoformat()
-        print("✅ Состояние аккаунта загружено")
-
-async def run_bot():
-    _setup_mock_environment()
-
-    # Load configuration
-    config = load_config()
-    if not config:
-        print("❌ Конфигурация не загружена. Проверьте config.json.")
-        return
-
-    print("🤖 Бот запущен - демонстрационная версия")
-
-    # Initialize Arena client
-    client = ArenaClient(config.get("api_secret"), config.get("account_id"), BASE_DIR / "cache")
-
-    # Initialize strategy
-    classifier = MinkowskiClassifier()
-    strategy_manager = StrategyManager(classifier)
-
-    # Load state
-    state = load_state()
-    if not state.status or state.status == "IDLE":
-        await _load_account_state(state)
-        save_state(state)
-
-    while True:
-        try:
-            print(f"🔄 Итерация бота - Статус: {state.status}")
-            
-            # Mock trading logic
-            symbols = [s["symbol"] for s in config.get("stocks", [])]
-            data = {}
-            for symbol in symbols:
-                print(f"📊 Получаем данные для {symbol}")
-                bars = await client.get_bars(symbol, timeframe="15m", days=30)
-                if bars is not None and bars != []:
-                    data[symbol] = normalize_df(bars)
-
-            # Generate signals
-            signals = strategy_manager.generate_signals(data)
-            state.last_signals = [f"{sym}: {sig}" for sym, sig in signals.items()]
-            print(f"📡 Сгенерированные сигналы: {signals}")
-
-            # Execute trades
-            for symbol, signal in signals.items():
-                if signal == "BUY":
-                    res = await client.place_order(symbol, side="SIDE_BUY", qty=1)
-                    if res:
-                        state.stats["BUY"] = state.stats.get("BUY", 0) + 1
-                        state.positions_owners[symbol] = STRATEGY_NAME
-                elif signal == "SELL":
-                    res = await client.place_order(symbol, side="SIDE_SELL", qty=int(state.positions_owners.get(symbol, 0)))
-                    if res:
-                        state.stats["SELL"] = state.stats.get("SELL", 0) + 1
-                        del state.positions_owners[symbol]
-
-            # Update state
-            state.daily_orders += len(signals)
-            state.last_update = datetime.now().isoformat()
-            save_state(state)
-
-            # Check for stop flag
-            stop_flag_path = BASE_DIR / "stop.flag"
-            if stop_flag_path.exists():
-                print("🚨 Флаг остановки обнаружен - остановка бота")
-                state.status = "STOPPED"
-                save_state(state)
-                print("🤖 Бот остановлен")
-                break
-
-            # Sleep before next iteration
-            print("⏳ Ожидание следующей итерации...")
-            await asyncio.sleep(60 * 15)  # 15 minutes
-
-        except KeyboardInterrupt:
-            print("🛑 Прерывание по Ctrl+C")
-            state.status = "STOPPED"
-            save_state(state)
-            break
-        except Exception as e:
-            error_msg = f"{datetime.now().isoformat()}: {str(e)}"
-            state.last_errors = state.last_errors or []
-            state.last_errors.append(error_msg)
-            save_state(state)
-            print(f"❌ Ошибка: {e}")
-            print("⏳ Ожидание перед повторной попыткой...")
-            await asyncio.sleep(60 * 5)  # 5 minutes
-
-    print("✅ Работа бота завершена")
-
-# Entry point
-if __name__ == "__main__":
+def save_positions_state(data: Dict):
+    """Сохранение маппинга открытых позиций"""
     try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        print("\n🛑 Бот остановлен пользователем")
-        sys.exit(0)
+        with open(POSITIONS_STATE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения positions_state.json: {e}")
+
+
+# ============================================================
+# ТОРГОВЫЙ БОТ
+# ============================================================
+
+class TradingBot:
+    """Главный торговый бот для стратегии Минковского"""
+    
+    def __init__(self):
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            self.config = json.load(f)
+        
+        # Инициализация компонентов
+        self.arena = ArenaClient(CONFIG_PATH)
+        self.strategy_manager = StrategyManager(self.config)
+        
+        # Состояние
+        self.initial_balance = None
+        self.daily_orders = 0
+        self.last_reset_date = None
+        self.is_stopped = False
+        
+        # Маппинг: symbol -> {"side": str, "entry_price": float, "opened_at": str}
+        self.position_owners = load_positions_state()
+    
+    def check_stop_flag(self) -> bool:
+        """Проверка флага остановки"""
+        if os.path.exists(STOP_FLAG):
+            try:
+                os.remove(STOP_FLAG)
+            except Exception:
+                pass
+            return True
+        return False
+    
+    def calculate_volume(self, price: float) -> int:
+        """Расчёт объёма позиции"""
+        balance = self.arena.get_balance()
+        if balance == 0 or price == 0:
+            return 1
+        
+        volume_type = self.config.get("volume_type", "deposit_percent")
+        volume_value = self.config.get("volume_value", 5.0)
+        
+        if volume_type == "deposit_percent":
+            amount = balance * (volume_value / 100)
+            return max(1, int(amount / price))
+        elif volume_type == "contracts":
+            return int(volume_value)
+        elif volume_type == "contract_currency":
+            return max(1, int(volume_value / price))
+        
+        return 1
+    
+    def check_daily_limit(self) -> bool:
+        """Проверка дневного лимита заявок"""
+        today = datetime.now().date()
+        if self.last_reset_date != today:
+            self.daily_orders = 0
+            self.last_reset_date = today
+            logger.info(f"🔄 Сброс счётчика заявок. Сегодня: {today}")
+        
+        max_orders = self.config.get("max_daily_orders", 190)
+        if self.daily_orders >= max_orders:
+            logger.warning(f"⛔ Дневной лимит достигнут: {self.daily_orders}/{max_orders}")
+            return False
+        return True
+    
+    def check_drawdown(self) -> str:
+        """Проверка просадки по equity (не по available_cash)"""
+        if self.initial_balance is None or self.initial_balance == 0:
+            return "OK"
+        
+        equity = self.arena.get_equity()
+        if equity == 0:
+            return "OK"
+        
+        drawdown_pct = max(0, (self.initial_balance - equity) / self.initial_balance)
+        
+        stop_pct = self.config.get("drawdown_stop_pct", 0.10)
+        reduce_pct = self.config.get("drawdown_reduce_pct", 0.05)
+        
+        if drawdown_pct >= stop_pct:
+            self.is_stopped = True
+            logger.error(f"⛔ ПРОСАДКА {drawdown_pct*100:.2f}% >= {stop_pct*100}%. ПОЛНАЯ ОСТАНОВКА!")
+            return "STOP"
+        elif drawdown_pct >= reduce_pct:
+            logger.warning(f"⚠ Просадка {drawdown_pct*100:.2f}% >= {reduce_pct*100}%. Уменьшаем объём")
+            return "REDUCE"
+        
+        return "OK"
+    
+    def check_hard_stop(self, positions: list) -> list:
+        """Проверка Hard Stop Loss по открытым позициям"""
+        to_close = []
+        hard_stop_pct = self.config.get("hard_stop_loss_pct", 0.02)
+        
+        if self.initial_balance is None or self.initial_balance == 0:
+            return to_close
+        
+        for pos in positions:
+            pnl = pos.get("unrealized_pnl", 0)
+            pnl_pct = pnl / self.initial_balance
+            
+            if pnl_pct <= -hard_stop_pct:
+                logger.error(
+                    f"🛑 HARD STOP LOSS: {pos['symbol']} P&L {pnl:.2f} "
+                    f"({pnl_pct*100:.2f}% <= -{hard_stop_pct*100}%)"
+                )
+                to_close.append(pos)
+        
+        return to_close
+    
+    def _open_position(self, symbol: str, action: str, price: float,
+                      reason: str, drawdown_status: str) -> bool:
+        """
+        Открытие позиции по сигналу MK
+        
+        Args:
+            symbol: тикер (например, SBER@MISX)
+            action: "BUY" или "SELL"
+            price: текущая цена
+            reason: причина входа
+            drawdown_status: "OK", "REDUCE" или "STOP"
+        """
+        # Рассчитываем объём
+        volume = self.calculate_volume(price)
+        
+        # Уменьшаем объём при просадке
+        if drawdown_status == "REDUCE":
+            volume = max(1, volume // 2)
+            logger.info(f"⚠ Объём уменьшен до {volume} из-за просадки")
+        
+        # Определяем сторону ордера
+        side = "SIDE_BUY" if action == "BUY" else "SIDE_SELL"
+        
+        # Отправляем ордер
+        logger.info(f"🚀 [{STRATEGY_NAME}] Открытие {action} {volume} {symbol} @ {price:.4f}")
+        result = self.arena.place_market_order(symbol, side, volume)
+        
+        if result:
+            exec_price = result.get("exec_price", price)
+            commission = result.get("commission", 0)
+            
+            log_trade(
+                ticker=symbol,
+                side=action,
+                price=exec_price,
+                volume=volume,
+                reason=reason,
+                pnl=0
+            )
+            
+            # Запоминаем позицию
+            self.position_owners[symbol] = {
+                "side": action,
+                "entry_price": exec_price,
+                "opened_at": datetime.now().isoformat()
+            }
+            save_positions_state(self.position_owners)
+            
+            self.daily_orders += 1
+            logger.info(
+                f"✅ [{STRATEGY_NAME}] Ордер исполнен: {action} {volume} "
+                f"@ {exec_price:.4f} (комиссия: {commission:.2f})"
+            )
+            return True
+        else:
+            logger.error(f"❌ [{STRATEGY_NAME}] Ордер не выполнен")
+            return False
+    
+    def _close_position(self, symbol: str, position: Dict, reason: str) -> bool:
+        """Закрытие позиции"""
+        side = "SIDE_SELL" if position['side'] == "BUY" else "SIDE_BUY"
+        volume = int(position['quantity'])
+        pnl = position.get('unrealized_pnl', 0)
+        
+        logger.info(
+            f"🔻 [{STRATEGY_NAME}] Закрытие {position['side']} {volume} {symbol}. "
+            f"Причина: {reason}"
+        )
+        
+        result = self.arena.place_market_order(symbol, side, volume)
+        
+        if result:
+            exec_price = result.get("exec_price", 0)
+            commission = result.get("commission", 0)
+            
+            log_trade(
+                ticker=symbol,
+                side=f"CLOSE_{side}",
+                price=exec_price,
+                volume=volume,
+                reason=reason,
+                pnl=pnl
+            )
+            
+            # Удаляем запись о позиции
+            if symbol in self.position_owners:
+                del self.position_owners[symbol]
+                save_positions_state(self.position_owners)
+            
+            self.daily_orders += 1
+            
+            emoji = "💰" if pnl >= 0 else "💸"
+            logger.info(
+                f"{emoji} [{STRATEGY_NAME}] Позиция закрыта. "
+                f"P&L: {pnl:+.2f} ₽ (комиссия: {commission:.2f})"
+            )
+            return True
+        else:
+            logger.error(f"❌ [{STRATEGY_NAME}] Не удалось закрыть позицию")
+            return False
+    
+    def run(self):
+        """Главный цикл торговли"""
+        logger.info("=" * 70)
+        logger.info("🚀 ЗАПУСК ТОРГОВОГО БОТА: LORENTZIAN CLASSIFICATION")
+        logger.info("=" * 70)
+        
+        # Получаем начальный equity (не available_cash — она проседает при покупках)
+        self.initial_balance = self.arena.get_equity()
+        logger.info(f"💰 Начальный equity: {self.initial_balance:,.2f} ₽")
+        
+        stocks = self.config.get("stocks", [])
+        if not stocks:
+            logger.error("❌ В config.json не настроен список stocks!")
+            return
+        
+        timeframe = self.config.get("timeframe", "15m")
+        bars_depth_days = self.config.get("bars_depth_days", 30)
+        
+        logger.info(f"📋 Инструментов: {len(stocks)} акций")
+        logger.info(f"⏱ Таймфрейм: {timeframe}, глубина: {bars_depth_days} дней")
+        logger.info(f"   {stocks[:5]}{'...' if len(stocks) > 5 else ''}")
+        
+        while not self.check_stop_flag():
+            try:
+                # 1. Горячая перезагрузка конфига
+                try:
+                    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+                        self.config = json.load(f)
+                    # Обновляем параметры strategy_manager
+                    self.strategy_manager.classifier.config = self.config
+                    # Перечитываем таймфрейм и глубину
+                    timeframe = self.config.get("timeframe", "15m")
+                    bars_depth_days = self.config.get("bars_depth_days", 30)
+                except Exception as e:
+                    logger.warning(f"⚠ Не удалось перезагрузить конфиг: {e}")
+                
+                # 2. Проверка глобальной остановки
+                if self.is_stopped:
+                    update_state({
+                        "status": "STOPPED",
+                        "balance": self.arena.get_balance(),
+                        "last_update": datetime.now().isoformat(),
+                        "last_signals": ["⛔ STOPPED by drawdown"],
+                    })
+                    time.sleep(60)
+                    continue
+                
+                # 3. Проверка просадки
+                drawdown_status = self.check_drawdown()
+                if drawdown_status == "STOP":
+                    balance = self.arena.get_balance()
+                    update_state({
+                        "status": "STOPPED",
+                        "balance": balance,
+                        "equity": balance,
+                        "cash": balance,
+                        "available_cash": balance,
+                        "open_positions": len(self.arena.get_positions()),
+                        "daily_orders": self.daily_orders,
+                        "drawdown_pct": 0.10,
+                        "last_signals": ["⛔ STOPPED by drawdown (10%)"],
+                        "last_update": datetime.now().isoformat(),
+                    })
+                    time.sleep(60)
+                    continue
+                
+                # 4. Проверка дневного лимита
+                if not self.check_daily_limit():
+                    balance = self.arena.get_balance()
+                    update_state({
+                        "status": "LIMIT_REACHED",
+                        "balance": balance,
+                        "daily_orders": self.daily_orders,
+                        "last_signals": [f"⛔ Дневной лимит: {self.daily_orders}/{self.config.get('max_daily_orders', 190)}"],
+                        "last_update": datetime.now().isoformat(),
+                    })
+                    time.sleep(60)
+                    continue
+                
+                # 5. Получаем актуальный баланс и позиции
+                balance = self.arena.get_balance()
+                account_info = self.arena.get_account_info()
+                equity = account_info.get("equity", balance) if account_info else balance
+                cash = account_info.get("cash", balance) if account_info else balance
+                available_cash = account_info.get("available_cash", balance) if account_info else balance
+                positions = self.arena.get_positions()
+                
+                # 6. Hard Stop Loss
+                hard_stop_positions = self.check_hard_stop(positions)
+                for pos in hard_stop_positions:
+                    self._close_position(
+                        pos['symbol'], pos,
+                        reason=f"Hard Stop Loss (P&L {pos.get('unrealized_pnl', 0):+.2f} ₽)"
+                    )
+                
+                # Обновляем позиции после закрытия hard stop
+                positions = self.arena.get_positions()
+                
+                # 7. Сканируем все инструменты
+                signals_log = []
+                errors_log = []
+                stats = {"BUY": 0, "SELL": 0, "CLOSE_LONG": 0, "CLOSE_SHORT": 0}
+                
+                for symbol in stocks:
+                    try:
+                        # Загружаем свечи
+                        df = self.arena.get_bars(symbol, timeframe=timeframe, days=bars_depth_days)
+                        
+                        if df is None or df.empty:
+                            errors_log.append(f"{symbol}: нет данных")
+                            continue
+                        
+                        # Нормализуем DataFrame
+                        df = normalize_df(df)
+                        
+                        # Ищем открытую позицию по этому инструменту
+                        position = next(
+                            (p for p in positions if p.get('symbol') == symbol),
+                            None
+                        )
+                        
+                        # Оцениваем тикер (StrategManager сам решит: вход или выход)
+                        signal = self.strategy_manager.evaluate_ticker(symbol, df)
+                        
+                        if not signal:
+                            continue
+                        
+                        action = signal['action']
+                        stats[action] = stats.get(action, 0) + 1
+                        
+                        # ============================================================
+                        # Обработка действий
+                        # ============================================================
+                        
+                        if action == "CLOSE_LONG":
+                            # Есть BUY позиция — закрываем
+                            if position and position['side'] == "BUY":
+                                success = self._close_position(symbol, position, signal['reason'])
+                                if success:
+                                    signals_log.append(f"🔻 [{STRATEGY_NAME}] {symbol}: CLOSED BUY ({signal['reason']})")
+                        
+                        elif action == "CLOSE_SHORT":
+                            # Есть SELL позиция — закрываем
+                            if position and position['side'] == "SELL":
+                                success = self._close_position(symbol, position, signal['reason'])
+                                if success:
+                                    signals_log.append(f"🔻 [{STRATEGY_NAME}] {symbol}: CLOSED SELL ({signal['reason']})")
+                        
+                        elif action == "BUY":
+                            # Входим в BUY (если нет позиции)
+                            if position is None:
+                                current_price = float(df['close'].iloc[-1])
+                                success = self._open_position(
+                                    symbol, "BUY", current_price, signal['reason'], drawdown_status
+                                )
+                                if success:
+                                    signals_log.append(
+                                        f"✅ [{STRATEGY_NAME}] {symbol}: BUY @ {current_price:.2f} "
+                                        f"(pred={signal['prediction']:.1f}, bars={signal['bars_held']})"
+                                    )
+                        
+                        elif action == "SELL":
+                            # Входим в SELL (если нет позиции)
+                            if position is None:
+                                current_price = float(df['close'].iloc[-1])
+                                success = self._open_position(
+                                    symbol, "SELL", current_price, signal['reason'], drawdown_status
+                                )
+                                if success:
+                                    signals_log.append(
+                                        f"✅ [{STRATEGY_NAME}] {symbol}: SELL @ {current_price:.2f} "
+                                        f"(pred={signal['prediction']:.1f}, bars={signal['bars_held']})"
+                                    )
+                    
+                    except Exception as e:
+                        error_msg = f"Ошибка {symbol}: {e}"
+                        logger.error(error_msg, exc_info=True)
+                        errors_log.append(error_msg)
+                
+                # 8. Обновляем state.json для UI
+                drawdown = (
+                    (self.initial_balance - balance) / self.initial_balance
+                    if self.initial_balance else 0
+                )
+                
+                update_state({
+                    "status": "RUNNING",
+                    "balance": balance,
+                    "equity": equity,
+                    "cash": cash,
+                    "available_cash": available_cash,
+                    "open_positions": len(positions),
+                    "daily_orders": self.daily_orders,
+                    "drawdown_pct": drawdown,
+                    "last_signals": signals_log[-20:] if signals_log else ["Нет сигналов"],
+                    "last_errors": errors_log[-5:] if errors_log else [],
+                    "stats": stats,
+                    "stocks_count": len(stocks),
+                    "positions_owners": self.position_owners,
+                    "last_update": datetime.now().isoformat(),
+                })
+                
+                logger.info(
+                    f"💤 Цикл завершён. "
+                    f"Баланс: {balance:,.2f} ₽ | "
+                    f"Позиций: {len(positions)} | "
+                    f"Сигналов: {len(signals_log)} | "
+                    f"Ошибок: {len(errors_log)}"
+                )
+                if any(v > 0 for v in stats.values()):
+                    logger.info(f"📊 Статистика действий: {stats}")
+                
+                # 9. Ждём 1 минуту перед следующим циклом
+                for _ in range(60):
+                    if self.check_stop_flag():
+                        return
+                    time.sleep(1)
+            
+            except Exception as e:
+                logger.error(f"❌ Критическая ошибка цикла: {e}", exc_info=True)
+                try:
+                    balance = self.arena.get_balance()
+                    update_state({
+                        "status": "ERROR",
+                        "balance": balance,
+                        "last_update": datetime.now().isoformat(),
+                        "last_errors": [f"Критическая ошибка: {str(e)}"],
+                    })
+                except Exception:
+                    pass
+                time.sleep(30)
+        
+        logger.info("⛔ Бот остановлен пользователем")
+
+
+# ============================================================
+# ТОЧКА ВХОДА
+# ============================================================
+
+if __name__ == "__main__":
+    bot = TradingBot()
+    bot.run()
