@@ -168,7 +168,7 @@ Minkowski-space/
 | `VOLUME_VALUE` | 15.0 | % депозита на сделку |
 | `MIN_EXPIRATION_DAYS` | 3 | Мин. дней до экспирации для входа |
 | `MAX_EXPIRATION_DAYS` | 100 | Макс. дней до экспирации для входа |
-| `CONTANGO_FILTER_COUNT` | 5 | Пар в每组 stage |
+| `CONTANGO_FILTER_COUNT` | 5 | Пар stage |
 | `LOOP_SLEEP_SEC` | 60 | Пауза между циклами (сек) |
 
 ### @magnets_bot (`config.json`)
